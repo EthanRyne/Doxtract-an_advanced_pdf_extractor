@@ -49,6 +49,7 @@ output = preprocess(
     extract_images=True,         # Extract raster images
     strip_headers_footers=True,  # Remove headers/footers from text
     preserve_layout=False,       # If True, use exact spacing from the PDF
+    max_workers=None,            # If given, will be used for parallel doc processing
     as_dataset=True              # Return a HuggingFace Dataset
 )
 print(output)
@@ -67,6 +68,7 @@ print(output)
 | `output_root`             | `str or Path` | Directory to store outputs and extracted media         |
 | `strip_headers_footers`   | `bool`        | Remove recurring headers/footers from output text      |
 | `preserve_layout`         | `bool`        | If True, use exact spacing from the PDF                |
+| `max_workers`             | `int`         | If given, will be used for parallel doc processing     |
 | `as_dataset`              | `bool`        | Return as HuggingFace `datasets.Dataset`               |
 | *(advanced tuning knobs)* |               |                                                        |
 | `vector_margin`           | `int`         | Padding around diagrams (in px)                        |
