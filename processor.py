@@ -34,7 +34,7 @@ from .utils.images import (
 __all__ = ["preprocess", "process_documents"]  # alias for backward compat
 
 # ╭──────────────────────────────────────────────────────────────────────╮
-# │ Conversion helper                                                   │
+# │ Conversion helper                                                    │
 # ╰──────────────────────────────────────────────────────────────────────╯
 
 def _convert_to_pdf(file_path: os.PathLike | str, output_dir: os.PathLike | str = "/tmp", *, verbose: bool = False) -> Path:
@@ -61,7 +61,7 @@ def _convert_to_pdf(file_path: os.PathLike | str, output_dir: os.PathLike | str 
 
 
 # ╭──────────────────────────────────────────────────────────────────────╮
-# │ OCR‑related guard                                                   │
+# │ OCR‑related guard                                                    │
 # ╰──────────────────────────────────────────────────────────────────────╯
 
 def _looks_scanned(pdf_path: Path) -> bool:
@@ -76,7 +76,93 @@ def _looks_scanned(pdf_path: Path) -> bool:
 
 
 # ╭──────────────────────────────────────────────────────────────────────╮
-# │ Main function                                                       │
+# │ Single page process                                                  │
+# ╰──────────────────────────────────────────────────────────────────────╯
+
+def _process_single_page(args):
+    (
+        pdf_path,
+        page_number,
+        markdown,
+        extract_vectors,
+        extract_images,
+        strip_headers_footers,
+        preserve_layout,
+        vector_margin,
+        y_tol,
+        space_thresh,
+        hf,
+        toc_pages,
+        diag_out,
+        img_out,
+    ) = args
+
+    doc = fitz.open(pdf_path)
+    page = doc[page_number]
+    pg = page_number + 1
+
+    # ——— diagrams ————————————————————————————————
+    diag_rects = []
+    if extract_vectors:
+        diag_rects = _detect_diagrams(page)
+        for idx, box in enumerate(diag_rects, 1):
+            out_image = diag_out / f"p{pg:03d}_{idx}.png"
+            page.get_pixmap(clip=expand_rect(box, vector_margin), dpi=300).save(out_image)
+
+    # ——— skip zones ———————————————————————————————
+    hdr_r = hf["page_header_rects"].get(pg, [])
+    ftr_r = hf["page_footer_rects"].get(pg, [])
+    skip_rects = diag_rects + (hdr_r + ftr_r if strip_headers_footers else [])
+
+    # ——— text extraction ————————————————————————————
+    if not preserve_layout:
+        content = page.get_text("text")
+    else:
+        if markdown:
+            content = "\n".join(
+                extract_markdown_layout(page, skip_rects, y_tol=y_tol, space_thresh=space_thresh)
+            )
+        else:
+            content = "\n".join(
+                extract_text_skip_rects(page, skip_rects, y_tol=y_tol, space_thresh=space_thresh)
+            )
+
+    meta = {
+        "document_name": Path(pdf_path).name,
+        "page_number": pg,
+        "is_toc_page": pg in toc_pages,
+        "page_content": content,
+        "headers": [page.get_textbox(r).strip() for r in hdr_r],
+        "footers": [page.get_textbox(r).strip() for r in ftr_r],
+        "diagrams": [],
+        "images_on_this_page": [],
+    }
+
+    for idx, box in enumerate(diag_rects, 1):
+        meta["diagrams"].append(
+            {
+                "path": str(diag_out / f"p{pg:03d}_{idx}.png"),
+                "bbox": [
+                    round(box.x0, 2),
+                    round(box.y0, 2),
+                    round(box.x1, 2),
+                    round(box.y1, 2),
+                ],
+            }
+        )
+
+    if extract_images:
+        for xref in get_visible_image_xrefs(page):
+            pix = fitz.Pixmap(doc, xref)
+            img_path = img_out / f"p{pg}_xref{xref}.png"
+            pix.save(img_path)
+            meta["images_on_this_page"].append(str(img_path))
+
+    doc.close()
+    return meta
+
+# ╭──────────────────────────────────────────────────────────────────────╮
+# │ Main function                                                        │
 # ╰──────────────────────────────────────────────────────────────────────╯
 
 def preprocess(
@@ -88,6 +174,7 @@ def preprocess(
     output_root: os.PathLike | str | None = None,
     strip_headers_footers: bool = True,
     preserve_layout: bool = False,
+    max_workers: int | None = None,
     as_dataset: bool = False,
     # advanced knobs
     vector_margin: int = 20,
@@ -125,6 +212,10 @@ def preprocess(
         If *True*, extracts page text with spacing preserved as-is from the PDF.
         This disables all layout rebuilding and formatting logic (e.g., markdown,
         indentation heuristics). Default is *False*.
+    max_workers
+        Number of workers for multi processing.
+        If given, will set to the minimum out of given and available cpu cores.
+        If not given, will set to the available cpu cores.
     as_dataset
         Return a `datasets.Dataset` instead of a nested ``dict``.
     vector_margin, page_top_pct, page_bottom_pct, min_header_pages,
@@ -192,63 +283,49 @@ def preprocess(
         toc_candidates = detect_toc_candidates(doc, threshold=toc_threshold, verbose=verbose)
         toc_pages = filter_page_sequence(toc_candidates)
 
-        for page in tqdm(doc, desc=f"Processing {path.name}", disable=not verbose):
-            pg = page.number + 1
-
-            # ——— diagrams ————————————————————————————————
-            diag_rects = []
-            if extract_vectors:
-                diag_rects = _detect_diagrams(page)
-                for idx, box in enumerate(diag_rects, 1):
-                    out_image = diag_out / f"p{pg:03d}_{idx}.png"
-                    page.get_pixmap(clip=expand_rect(box, vector_margin), dpi=300).save(out_image)
-
-            # ——— skip zones ———————————————————————————————
-            hdr_r = hf["page_header_rects"].get(pg, [])
-            ftr_r = hf["page_footer_rects"].get(pg, [])
-            skip_rects = diag_rects + (hdr_r + ftr_r if strip_headers_footers else [])
-
-            # ——— text extraction ————————————————————————————
-            if not preserve_layout:
-                content = page.get_text("text")  # Raw layout-preserved output
-            else:
-                if markdown:
-                    content = "\n".join(
-                        extract_markdown_layout(page, skip_rects, y_tol=y_tol, space_thresh=space_thresh)
-                    )
-                else:
-                    content = "\n".join(
-                        extract_text_skip_rects(page, skip_rects, y_tol=y_tol, space_thresh=space_thresh)
-                    )
-
-            meta = {
-                "document_name": path.name,
-                "page_number": pg,
-                "is_toc_page": pg in toc_pages,
-                "page_content": content,
-                "headers": [page.get_textbox(r).strip() for r in hdr_r],
-                "footers": [page.get_textbox(r).strip() for r in ftr_r],
-                "diagrams": [],
-                "images_on_this_page": [],
-            }
-
-            for idx, box in enumerate(diag_rects, 1):
-                meta["diagrams"].append(
-                    {
-                        "path": str(diag_out / f"p{pg:03d}_{idx}.png"),
-                        "bbox": [round(box.x0, 2), round(box.y0, 2), round(box.x1, 2), round(box.y1, 2)],
-                    }
+        # ——— multi processing ————————————————————————————————
+        tasks = []
+        total_pages = len(doc)
+        
+        for i in range(total_pages):
+            tasks.append(
+                (
+                    str(path),
+                    i,
+                    markdown,
+                    extract_vectors,
+                    extract_images,
+                    strip_headers_footers,
+                    preserve_layout,
+                    vector_margin,
+                    y_tol,
+                    space_thresh,
+                    hf,
+                    toc_pages,
+                    diag_out,
+                    img_out,
                 )
+            )
 
-            if extract_images:
-                for xref in get_visible_image_xrefs(page):
-                    pix = fitz.Pixmap(doc, xref)
-                    img_path = img_out / f"p{pg}_xref{xref}.png"
-                    pix.save(img_path)
-                    meta["images_on_this_page"].append(str(img_path))
-
-            dataset_rows.append(meta)
-            legacy[path.name].append(meta)
+        if max_workers:
+            max_workers = max(1, min(max_workers, mp.cpu_count() - 1))
+        else:
+            max_workers = max(1, mp.cpu_count() - 1)
+        if max_workers == 1:
+            print("Max Workers is set to 1, document processing won't speed up ") 
+        
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_process_single_page, t) for t in tasks]
+        
+            for future in tqdm(
+                as_completed(futures),
+                total=len(futures),
+                desc=f"Processing {path.name}",
+                disable=not verbose,
+            ):
+                meta = future.result()
+                dataset_rows.append(meta)
+                legacy[path.name].append(meta)
 
     # ——— return value ————————————————————————————————
     if as_dataset:
